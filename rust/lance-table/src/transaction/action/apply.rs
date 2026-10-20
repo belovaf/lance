@@ -551,9 +551,14 @@ impl<'a> ApplyState<'a> {
 
     pub(super) fn resolve_base(&self, reference: Ref) -> Result<u32> {
         match reference {
-            Ref::Committed(id) => u32::try_from(id).map_err(|_| {
-                Error::invalid_input(format!("base id {id} in an action is out of range"))
-            }),
+            Ref::Committed(id) => u32::try_from(id)
+                .ok()
+                .filter(|id| self.existing_base_paths.contains_key(id))
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "base id {id} in an action names no base path of the dataset"
+                    ))
+                }),
             Ref::Local(token) => self
                 .base_tokens
                 .get(&token)

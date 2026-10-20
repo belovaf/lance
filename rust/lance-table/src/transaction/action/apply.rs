@@ -140,10 +140,6 @@ pub(super) struct ApplyState<'a> {
     /// adjusted, whose segment sets are validated once the operation has run.
     touched_index_names: BTreeSet<String>,
 
-    /// Fields whose backing data changed, per fragment. An index covering such
-    /// a field no longer describes that fragment's contents.
-    rebound_fields: HashMap<u64, HashSet<i32>>,
-
     /// The version the transaction was built against. Not the current
     /// manifest's version: on a retry the set is replayed onto something newer,
     /// and what an action saw is still the version it read.
@@ -183,7 +179,6 @@ impl<'a> ApplyState<'a> {
             reserved_fragment_ids: None,
             reserved_row_ids: 0,
             touched_index_names: BTreeSet::new(),
-            rebound_fields: HashMap::new(),
         }
     }
 
@@ -211,14 +206,12 @@ impl<'a> ApplyState<'a> {
             mut indices,
             touched_index_names,
             new_bases,
-            rebound_fields,
             reserved_fragment_ids,
             config: dataset_config,
             table_metadata,
             ..
         } = self;
 
-        prune_rebound_fields_from_indices(&mut indices, &rebound_fields, &current_manifest.schema);
         Transaction::retain_relevant_indices(&mut indices, &schema, &fragments);
         validate_index_segment_sets(&indices, &touched_index_names)?;
 
@@ -431,7 +424,6 @@ impl<'a> ApplyState<'a> {
             return false;
         }
         self.new_fragments.remove(&fragment_id);
-        self.rebound_fields.remove(&fragment_id);
         true
     }
 
@@ -444,7 +436,6 @@ impl<'a> ApplyState<'a> {
         self.fragments.clear();
         self.indices.clear();
         self.new_fragments.clear();
-        self.rebound_fields.clear();
     }
 
     /// The base paths this apply can see: the current manifest's, plus the ones
@@ -586,15 +577,22 @@ impl<'a> ApplyState<'a> {
 
     /// Record that these fields' data in this fragment no longer matches what
     /// an index built over them recorded.
+    ///
+    /// Prunes the segments present now rather than at assembly: a segment an
+    /// later action in this operation adds was built over the new data, so the
+    /// rebind does not invalidate it.
     pub(super) fn rebind_fields(
         &mut self,
         fragment_id: u64,
         fields: impl IntoIterator<Item = i32>,
     ) {
-        self.rebound_fields
-            .entry(fragment_id)
-            .or_default()
-            .extend(fields);
+        let fields: Vec<i32> = fields.into_iter().collect();
+        prune_rebound_fields_from_indices(
+            &mut self.indices,
+            fragment_id,
+            &fields,
+            &self.current_manifest.schema,
+        );
     }
 
     /// Stamp row ids and version metadata onto the fragments this operation
@@ -709,24 +707,22 @@ impl<'a> ApplyState<'a> {
 /// moves has already left the schema being built.
 fn prune_rebound_fields_from_indices(
     indices: &mut [IndexMetadata],
-    rebound: &HashMap<u64, HashSet<i32>>,
+    fragment_id: u64,
+    fields: &[i32],
     base_schema: &Schema,
 ) {
-    if rebound.is_empty() {
+    let Ok(fragment_id) = u32::try_from(fragment_id) else {
         return;
-    }
+    };
     for index in indices.iter_mut() {
         let Some(bitmap) = index.fragment_bitmap.as_mut() else {
             continue;
         };
-        for (fragment_id, fields) in rebound {
-            if fields
-                .iter()
-                .any(|field| field_affects_index(*field, &index.fields, base_schema))
-                && let Ok(fragment_id) = u32::try_from(*fragment_id)
-            {
-                bitmap.remove(fragment_id);
-            }
+        if fields
+            .iter()
+            .any(|field| field_affects_index(*field, &index.fields, base_schema))
+        {
+            bitmap.remove(fragment_id);
         }
     }
 }

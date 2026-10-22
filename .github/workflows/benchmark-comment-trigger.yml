@@ -19,9 +19,12 @@ permissions:
 
 jobs:
   forward-to-bench:
-    # Only process comments on PRs that mention @bench-bot and contain 'benchmark'
+    # Only process comments on PRs that mention @bench-bot and contain 'benchmark'.
+    # Benchmarks run the PR's code with lance-bench credentials, so only trusted
+    # users may trigger them; PR authorship alone is not enough.
     if: |
       github.event.issue.pull_request != null &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
       contains(github.event.comment.body, '@bench-bot') &&
       contains(github.event.comment.body, 'benchmark')
     runs-on: ubuntu-latest

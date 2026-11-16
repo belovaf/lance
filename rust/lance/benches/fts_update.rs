@@ -14,6 +14,9 @@
 //! Every iteration restores the same seed snapshot in a temporary dataset.
 //! Timings include the complete optimize call and its commit, not just remap.
 
+// The benchmark reports its measurements to the person running it.
+#![allow(clippy::print_stdout)]
+
 use std::{env, sync::Arc, time::Instant};
 
 use arrow_array::{

@@ -10,6 +10,7 @@
 //! STRIDE=1 gives common labels, 128 gives sparse labels. Rewrite 1 or 64 fragments.
 //! Timings separate the remap commit from rewriting data and from warm indexed counts.
 
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -152,13 +153,14 @@ async fn run(uri: &str, stride: usize, rewritten: usize) -> Result<()> {
         0
     );
     times.sort_by(f64::total_cmp);
-    println!(
+    writeln!(
+        io::stdout().lock(),
         "stride={stride} rewritten={rewritten} remap_commit_ms={remap_ms:.3} search_p50_ms={:.3} search_p95_ms={:.3} segments={} matches={}",
         times[19],
         times[37],
         segments.len(),
         actual.len()
-    );
+    )?;
     Ok(())
 }
 

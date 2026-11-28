@@ -554,6 +554,7 @@ class _Dataset:
         row_indices: List[int],
         columns: Optional[List[str]] = None,
         columns_with_transform: Optional[List[Tuple[str, str]]] = None,
+        io_parallelism: Optional[int] = None,
     ) -> pa.RecordBatch: ...
     def take_rows(
         self,
@@ -1055,6 +1056,8 @@ class _ShardWriter:
     def lsm_scanner(
         self, shard_snapshots: List[_ShardSnapshot] = ...
     ) -> _LsmScanner: ...
+    def __enter__(self) -> Self: ...
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool: ...
 
 class _LsmScanner:
     @staticmethod

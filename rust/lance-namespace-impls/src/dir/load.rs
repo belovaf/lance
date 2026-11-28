@@ -7,9 +7,8 @@ use lance_core::Result;
 use lance_namespace::LanceNamespace;
 use lance_namespace::error::NamespaceError;
 use lance_namespace::models::{DescribeTableRequest, DescribeTableResponse};
-use lance_namespace::schema::arrow_schema_to_json;
 
-use super::{DirectoryNamespace, manifest, manifest_feature_flags};
+use super::{DirectoryNamespace, manifest_feature_flags, snapshot::SnapshotReader};
 
 impl DirectoryNamespace {
     /// Internal describe_table implementation that doesn't record metrics.
@@ -21,20 +20,18 @@ impl DirectoryNamespace {
     ) -> Result<DescribeTableResponse> {
         let is_root_level = request.id.as_ref().is_some_and(|id| id.len() == 1);
         let is_child_table = request.id.as_ref().is_some_and(|id| id.len() > 1);
-        let skip_manifest_for_root = self.dir_listing_enabled
-            && is_root_level
-            && !self.dir_listing_to_manifest_migration_enabled;
+        let probe_manifest_for_root = self.table_discovery_mode.uses_manifest_for_root();
+        let skip_manifest_for_root = is_root_level
+            && self.table_discovery_mode.has_directory_listing()
+            && !probe_manifest_for_root;
         // Self-heal the manifest wherever it can be authoritative: a child table
         // (no dir-listing fallback), a manifest-only namespace, or migration mode
         // (manifest-first -- it can hold registered_table -> external .lance
         // aliases that dir-listing cannot resolve, so a reader built before
         // __manifest must re-probe to see them). The bypass -- skipping the probe
-        // -- applies ONLY to migration-disabled directory-backed root reads,
+        // -- applies ONLY to directory-backed root reads without migration,
         // which are served entirely from the directory listing.
-        if is_child_table
-            || !self.dir_listing_enabled
-            || self.dir_listing_to_manifest_migration_enabled
-        {
+        if is_child_table || probe_manifest_for_root {
             self.ensure_read_manifest().await?;
         }
         if let Some(manifest_ns) = self.manifest_ns_for_read()
@@ -61,7 +58,7 @@ impl DirectoryNamespace {
                     // rather than degrading to a directory-listing view.
                     return Err(e);
                 }
-                Err(e) if self.dir_listing_enabled && is_root_level => {
+                Err(e) if self.table_discovery_mode.has_directory_listing() && is_root_level => {
                     // Only a genuinely-absent table (e.g. an unmigrated on-disk
                     // table) may fall through to the directory check; any other
                     // manifest error must propagate rather than be read as missing.
@@ -78,7 +75,7 @@ impl DirectoryNamespace {
 
         let table_name = Self::table_name_from_id(&request.id)?;
         let table_id = Self::format_table_id_from_request(&request.id);
-        if !self.dir_listing_enabled {
+        if !self.table_discovery_mode.has_directory_listing() {
             return Err(NamespaceError::TableNotFound { message: table_id }.into());
         }
 
@@ -117,173 +114,40 @@ impl DirectoryNamespace {
             None
         };
 
-        if !load_detailed_metadata {
-            let storage_options = self
-                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
-                .await?;
-            return Ok(DescribeTableResponse {
-                table: Some(table_name),
-                namespace: request.id.as_ref().map(|id| {
-                    if id.len() > 1 {
-                        id[..id.len() - 1].to_vec()
-                    } else {
-                        vec![]
-                    }
-                }),
-                location: Some(table_uri.clone()),
-                table_uri: Some(table_uri),
-                storage_options,
-                is_only_declared,
-                managed_versioning: if self.table_version_tracking_enabled {
-                    Some(true)
-                } else {
-                    None
-                },
-                ..Default::default()
-            });
-        }
+        let snapshot = self
+            .snapshot_reader()
+            .describe(&request, &table_name, &table_uri, is_only_declared)
+            .await?;
+        let storage_options = self
+            .get_storage_options_for_table(&table_uri, vend_credentials, identity)
+            .await?;
+        Ok(DescribeTableResponse {
+            table: Some(table_name),
+            namespace: request
+                .id
+                .as_ref()
+                .map(|id| id[..id.len().saturating_sub(1)].to_vec()),
+            location: Some(table_uri.clone()),
+            table_uri: Some(table_uri),
+            storage_options,
+            is_only_declared,
+            managed_versioning: self.table_version_tracking_enabled.then_some(true),
+            ..snapshot
+        })
+    }
 
-        if is_only_declared == Some(true) {
-            let storage_options = self
-                .get_storage_options_for_table(&table_uri, vend_credentials, identity)
-                .await?;
-            return Ok(DescribeTableResponse {
-                table: Some(table_name),
-                namespace: request.id.as_ref().map(|id| {
-                    if id.len() > 1 {
-                        id[..id.len() - 1].to_vec()
-                    } else {
-                        vec![]
-                    }
-                }),
-                location: Some(table_uri.clone()),
-                table_uri: Some(table_uri),
-                storage_options,
-                is_only_declared,
-                managed_versioning: if self.table_version_tracking_enabled {
-                    Some(true)
-                } else {
-                    None
-                },
-                ..Default::default()
-            });
-        }
-
-        // Try to load the dataset to get real information
-        // Use DatasetBuilder with storage options to support S3 with custom endpoints
-        let mut builder = DatasetBuilder::from_uri(&table_uri);
-        if let Some(opts) = &self.storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
-        if let Some(sess) = &self.session {
-            builder = builder.with_session(sess.clone());
-        }
-        match builder.load().await {
-            Ok(mut dataset) => {
-                // If a specific version is requested, checkout that version
-                if let Some(requested_version) = request.version {
-                    dataset = dataset
-                        .checkout_version(requested_version as u64)
-                        .await
-                        .map_err(|e| {
-                            let message = format!(
-                                "Version {} not found for table '{}': {}",
-                                requested_version, table_name, e
-                            );
-                            Self::map_open_error(
-                                e,
-                                NamespaceError::TableVersionNotFound { message },
-                            )
-                        })?;
-                }
-
-                let version_info = dataset.version();
-                let lance_schema = dataset.schema();
-                let arrow_schema: arrow_schema::Schema = lance_schema.into();
-                let json_schema = arrow_schema_to_json(&arrow_schema)?;
-                let storage_options = self
-                    .get_storage_options_for_table(&table_uri, vend_credentials, identity)
-                    .await?;
-
-                // Convert BTreeMap to HashMap for the response
-                let metadata: std::collections::HashMap<String, String> =
-                    version_info.metadata.into_iter().collect();
-
-                Ok(DescribeTableResponse {
-                    table: Some(table_name),
-                    namespace: request.id.as_ref().map(|id| {
-                        if id.len() > 1 {
-                            id[..id.len() - 1].to_vec()
-                        } else {
-                            vec![]
-                        }
-                    }),
-                    version: Some(version_info.version as i64),
-                    location: Some(table_uri.clone()),
-                    table_uri: Some(table_uri),
-                    schema: Some(Box::new(json_schema)),
-                    storage_options,
-                    metadata: Some(metadata),
-                    is_only_declared,
-                    managed_versioning: if self.table_version_tracking_enabled {
-                        Some(true)
-                    } else {
-                        None
-                    },
-                    ..Default::default()
-                })
-            }
-            Err(err) => {
-                if manifest::ManifestNamespace::is_not_found_load_error(&err)
-                    && is_only_declared == Some(true)
-                {
-                    let storage_options = self
-                        .get_storage_options_for_table(&table_uri, vend_credentials, identity)
-                        .await?;
-                    Ok(DescribeTableResponse {
-                        table: Some(table_name),
-                        namespace: request.id.as_ref().map(|id| {
-                            if id.len() > 1 {
-                                id[..id.len() - 1].to_vec()
-                            } else {
-                                vec![]
-                            }
-                        }),
-                        location: Some(table_uri.clone()),
-                        table_uri: Some(table_uri),
-                        storage_options,
-                        is_only_declared,
-                        managed_versioning: if self.table_version_tracking_enabled {
-                            Some(true)
-                        } else {
-                            None
-                        },
-                        ..Default::default()
-                    })
-                } else {
-                    Err(NamespaceError::Internal {
-                        message: format!(
-                            "Table directory exists but cannot load dataset {}: {:?}",
-                            table_name, err
-                        ),
-                    }
-                    .into())
-                }
-            }
+    fn snapshot_reader(&self) -> SnapshotReader<'_> {
+        SnapshotReader {
+            table_path: &self.base_path,
+            storage_options: self.storage_options.as_ref(),
+            session: self.session.as_ref(),
         }
     }
 
     /// Build a `DatasetBuilder` for `table_uri` with this namespace's storage
     /// options and session applied. Callers add version/branch scoping.
     pub(super) fn configured_builder(&self, table_uri: &str) -> DatasetBuilder {
-        let mut builder = DatasetBuilder::from_uri(table_uri);
-        if let Some(opts) = &self.storage_options {
-            builder = builder.with_storage_options(opts.clone());
-        }
-        if let Some(sess) = &self.session {
-            builder = builder.with_session(sess.clone());
-        }
-        builder
+        self.snapshot_reader().configured_builder(table_uri)
     }
 
     pub(super) async fn load_dataset(

@@ -39,6 +39,7 @@ pub(super) struct Staged {
     /// Carried separately because `CommitBuilder` takes it separately; the
     /// second phase of delete/update conflict detection needs it.
     pub affected_rows: Option<RowAddrTreeMap>,
+    inserted_row_count: Option<u64>,
 }
 
 impl Staged {
@@ -46,6 +47,7 @@ impl Staged {
         Self {
             transaction,
             affected_rows: None,
+            inserted_row_count: None,
         }
     }
 
@@ -53,6 +55,7 @@ impl Staged {
         Self {
             transaction,
             affected_rows,
+            inserted_row_count: None,
         }
     }
 
@@ -60,6 +63,9 @@ impl Staged {
     /// the latest version is what forces the rebase under test.
     pub async fn commit(self, base: &Arc<Dataset>) -> Result<Dataset> {
         let mut builder = CommitBuilder::new(base.clone()).with_max_retries(1);
+        if let Some(count) = self.inserted_row_count {
+            builder = builder.with_inserted_row_count(count);
+        }
         if let Some(rows) = self.affected_rows {
             builder = builder.with_affected_rows(rows);
         }
@@ -433,10 +439,11 @@ async fn stage_update_rewrite_rows(dataset: &Arc<Dataset>, fragment: usize) -> R
         .try_build()?
         .execute_uncommitted(reader)
         .await?;
-    Ok(Staged::with_affected_rows(
-        staged.transaction,
-        staged.affected_rows,
-    ))
+    Ok(Staged {
+        transaction: staged.transaction,
+        affected_rows: staged.affected_rows,
+        inserted_row_count: Some(staged.stats.num_inserted_rows),
+    })
 }
 
 /// `RewriteColumns` has no uncommitted builder, so it is assembled from the
@@ -646,8 +653,8 @@ async fn stage_rewrite(dataset: &Arc<Dataset>, fragment: usize) -> Result<Staged
         // A rewrite carries the old rows' identities onto the new fragment.
         // Reuse compaction's own transfer rather than reimplementing it, or the
         // new fragment arrives with no row ids and the commit is rejected.
-        crate::dataset::optimize::execution::rechunk_row_lineage(
-            dataset.as_ref(),
+        lance_table_runtime::optimize::execution::rechunk_row_lineage(
+            &dataset.table_view().to_table(),
             &mut fragments,
             std::slice::from_ref(&old),
         )
@@ -687,8 +694,13 @@ async fn write_value_file(
     // only a human-readable hint: two stagings of the same scenario must not
     // collide, or the second silently overwrites the first's contents.
     let filename = format!("{name}-{}.lance", uuid::Uuid::new_v4());
-    let path = dataset.base.clone().join("data").join(filename.as_str());
-    let writer = dataset.object_store.create(&path).await?;
+    let path = dataset
+        .table_state
+        .base
+        .clone()
+        .join("data")
+        .join(filename.as_str());
+    let writer = dataset.table_state.object_store.create(&path).await?;
     let file_version = dataset.manifest.data_storage_format.lance_file_format();
     let mut writer = lance_file::versions::create_writer(
         file_version,

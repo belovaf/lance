@@ -10,6 +10,7 @@ use crate::{
     Dataset,
     dataset::{ExternalBlobMode, WriteMode, WriteParams, versions},
 };
+use itertools::Itertools;
 use lance_core::{Error, Result};
 use lance_datafusion::exec::new_session_context;
 use lance_file::version::LanceFileVersion;
@@ -28,37 +29,49 @@ impl MergeInsertBuilder {
     pub fn try_new(dataset: Arc<Dataset>, on: Vec<String>) -> Result<Self> {
         // Determine the join keys to use. If `on` is empty, fall back to the
         // schema's unenforced primary key (if configured).
+        let schema = dataset.schema();
         let resolved_on = if on.is_empty() {
-            let schema = dataset.schema();
-            let pk_fields = schema.unenforced_primary_key();
-
-            if pk_fields.is_empty() {
+            let primary_key = schema.unenforced_primary_key();
+            if primary_key.is_empty() {
                 return Err(Error::invalid_input(
                     "A merge insert operation requires join keys: specify `on` columns explicitly or configure a primary key in the dataset schema",
                 ));
             }
 
-            pk_fields
+            primary_key
                 .iter()
                 .map(|field| schema.field_path(field.id))
                 .collect::<Result<Vec<_>>>()?
         } else {
             // Resolve column names using case-insensitive matching to handle
             // lowercased column names from SQL parsing or user input
-            on.iter()
+            let mut columns = on
+                .iter()
                 .map(|col| {
-                    dataset
-                        .schema()
-                        .field_case_insensitive(col)
-                        .map(|f| f.name.clone())
-                        .ok_or_else(|| {
-                            Error::invalid_input(format!(
-                                "Merge insert key column '{}' does not exist in schema",
-                                col
-                            ))
-                        })
+                    schema.field_case_insensitive(col).ok_or_else(|| {
+                        Error::invalid_input(format!(
+                            "Merge insert key column '{}' does not exist in schema",
+                            col
+                        ))
+                    })
                 })
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Result<Vec<_>>>()?;
+            // Equality joins are order-independent. Encode composite primary keys
+            // in their declared order so independent writers compare the same tuples.
+            if columns.len() > 1
+                && columns
+                    .iter()
+                    .all(|field| field.is_unenforced_primary_key())
+                && let primary_key = schema.unenforced_primary_key()
+                && primary_key.len() == columns.len()
+                && columns.iter().map(|field| field.id).all_unique()
+            {
+                columns = primary_key;
+            }
+            columns
+                .into_iter()
+                .map(|field| field.name.clone())
+                .collect()
         };
 
         Ok(Self {
@@ -87,7 +100,11 @@ impl MergeInsertBuilder {
         })
     }
 
-    /// Specify what should happen when a target row matches a row in the source
+    /// Specify what should happen when a target row matches a row in the source.
+    ///
+    /// Updates may omit target fields, but any supplied list must include all
+    /// of its item fields. Partial list item schemas are rejected because their
+    /// offsets and validity cannot safely be updated independently.
     pub fn when_matched(&mut self, behavior: WhenMatched) -> &mut Self {
         self.params.when_matched = behavior;
         self
@@ -149,9 +166,9 @@ impl MergeInsertBuilder {
     ///
     /// This is the maximum time to spend on the operation before giving up. At
     /// least one attempt will be made, regardless of how long it takes to complete.
-    /// Subsequent attempts will be cancelled once this timeout is reached. If
-    /// the timeout has been reached during the first attempt, the operation
-    /// will be cancelled immediately.
+    /// On later attempts, execution and backoff are cancelled once this timeout
+    /// is reached and no new commit is started, but a commit that has already
+    /// started finishes and its result is returned.
     ///
     /// The default is 30 seconds.
     pub fn retry_timeout(&mut self, timeout: Duration) -> &mut Self {

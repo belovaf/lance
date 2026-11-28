@@ -1881,3 +1881,59 @@ async fn test_merge_insert_cleans_up_data_on_apply_deletions_failure() {
         "Newly written merge-insert data files should be cleaned up on apply_deletions failure"
     );
 }
+
+#[rstest::rstest]
+#[case::append_first(true)]
+#[case::cleanup_first(false)]
+#[tokio::test]
+async fn test_primary_key_anti_join_concurrent_insert(#[case] append_first: bool) {
+    let id = Field::new("id", DataType::UInt32, false).with_metadata(HashMap::from([(
+        "lance-schema:unenforced-primary-key".to_owned(),
+        "true".to_owned(),
+    )]));
+    let schema = Arc::new(Schema::new(vec![id]));
+    let batch = |keys: Vec<u32>| {
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(UInt32Array::from(keys))]).unwrap()
+    };
+    let dataset = Arc::new(
+        InsertBuilder::new("memory://")
+            .execute(vec![batch(vec![1, 2])])
+            .await
+            .unwrap(),
+    );
+    let job = || MergeInsertBuilder::try_new(dataset.clone(), vec!["id".to_owned()]).unwrap();
+    let cleanup = job()
+        .when_not_matched(WhenNotMatched::DoNothing)
+        .when_not_matched_by_source(WhenNotMatchedBySource::Delete)
+        .conflict_retries(1)
+        .try_build()
+        .unwrap();
+    let latest = if append_first {
+        InsertBuilder::new(dataset.clone())
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![batch(vec![3])])
+            .await
+            .unwrap();
+        let (latest, stats) = cleanup.execute_batches(vec![batch(vec![1])]).await.unwrap();
+        assert_eq!(stats.num_attempts, 2);
+        latest
+    } else {
+        let insert = job().conflict_retries(0).try_build().unwrap();
+        cleanup.execute_batches(vec![batch(vec![1])]).await.unwrap();
+        let (latest, stats) = insert.execute_batches(vec![batch(vec![3])]).await.unwrap();
+        assert_eq!(stats.num_attempts, 1);
+        latest
+    };
+    assert_eq!(
+        latest.count_rows(None).await.unwrap(),
+        if append_first { 1 } else { 2 }
+    );
+    assert_eq!(latest.count_rows(Some("id = 1".into())).await.unwrap(), 1);
+    assert_eq!(
+        latest.count_rows(Some("id = 3".into())).await.unwrap(),
+        usize::from(!append_first)
+    );
+}

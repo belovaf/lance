@@ -1348,7 +1348,17 @@ impl MergeInsertJob {
                 Error::internal("Transaction not available - execution may not have completed")
             })?;
             let affected_rows = delete_exec.affected_rows().map(RowAddrTreeMap::from);
-            (stats, transaction, affected_rows, None)
+            let Operation::Update {
+                inserted_rows_filter,
+                ..
+            } = &transaction.operation
+            else {
+                return Err(Error::internal(
+                    "Expected an update transaction for delete-only merge",
+                ));
+            };
+            let inserted_rows_filter = inserted_rows_filter.clone();
+            (stats, transaction, affected_rows, inserted_rows_filter)
         } else {
             return Err(Error::internal(
                 "Expected FullSchemaMergeInsertExec, InPlaceMergeInsertExec or DeleteOnlyMergeInsertExec",

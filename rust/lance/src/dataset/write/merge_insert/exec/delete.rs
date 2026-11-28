@@ -30,6 +30,7 @@ use roaring::RoaringTreemap;
 use crate::Dataset;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::write::merge_insert::assign_action::Action;
+use crate::dataset::write::merge_insert::inserted_rows::KeyExistenceFilterBuilder;
 use crate::dataset::write::merge_insert::{
     MERGE_ACTION_COLUMN, MergeInsertParams, MergeStats, SourceDedupeBehavior,
     create_duplicate_row_error, resolve_target_bases,
@@ -348,6 +349,15 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                     .await
                     .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
 
+            // A primary-key anti join depends on the absence of other target keys.
+            // An empty filter records that dependency without claiming any inserted keys.
+            let inserted_rows_filter = if params.deletes_only_unmatched_targets() {
+                params
+                    .primary_key_field_ids(dataset.schema())
+                    .map(|ids| KeyExistenceFilterBuilder::new(ids).build())
+            } else {
+                None
+            };
             let operation = Operation::Update {
                 removed_fragment_ids,
                 updated_fragments,
@@ -362,7 +372,7 @@ impl ExecutionPlan for DeleteOnlyMergeInsertExec {
                     .map(|f| f.id as u32)
                     .collect(),
                 update_mode: None,
-                inserted_rows_filter: None, // Delete-only operations don't insert rows
+                inserted_rows_filter,
                 updated_fragment_offsets: None,
             };
 

@@ -5691,7 +5691,6 @@ mod tests {
         throttle
             .config_mut(|config| config.wait_get_per_call = std::time::Duration::from_millis(25));
         remote.io_stats_incremental();
-        let start = std::time::Instant::now();
         BitmapIndex::merge_segments(
             &sources,
             utf8_value_stream(std::iter::empty::<Option<&str>>(), std::iter::empty()),
@@ -5701,7 +5700,6 @@ mod tests {
         .await
         .unwrap();
         let remote_reads = remote.io_stats_incremental().read_iops;
-        eprintln!("remote reads: {remote_reads}, merge: {:?}", start.elapsed());
 
         let output = read_bitmap_contents(dest.as_ref()).await;
         assert_eq!(output.len(), KEYS as usize + 1);
